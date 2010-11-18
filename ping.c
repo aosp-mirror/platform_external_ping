@@ -63,6 +63,8 @@ char copyright[] =
 #include <netinet/ip.h>
 #include <linux/icmp.h>
 #include <sched.h>
+#include <sys/types.h>
+#include <private/android_filesystem_config.h>
 
 #define bzero(b,sz) memset(b, 0, sz)
 
@@ -1669,6 +1671,40 @@ void usage(void)
 	exit(2);
 }
 
+int isInSupplementaryGroup(gid_t group) {
+	long ngroups_max;
+	gid_t *groups;
+	int ngroups;
+	int i;
+
+	if (getuid() == 0) {
+		// root is presumed to be in every group
+		return 1;
+	}
+
+	ngroups_max = sysconf(_SC_NGROUPS_MAX) + 1;
+	groups = (gid_t *) malloc(ngroups_max * sizeof(gid_t));
+	if (groups == NULL) {
+		fprintf(stderr, "ping: unable to allocate memory.  Aborting\n");
+		exit(2);
+	}
+	ngroups = getgroups(ngroups_max, groups);
+	if (ngroups < 0) {
+		perror("ping: getgroups failed");
+		exit(2);
+	}
+
+	for (i = 0; i < ngroups; i++) {
+		if (group == groups[i]) {
+			free(groups);
+			return 1;
+		}
+	}
+
+	free(groups);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct hostent *hp;
@@ -1683,6 +1719,11 @@ int main(int argc, char *argv[])
 
 	/* if we were setuid root, undo that */
 	if (setuid(getuid())) return -1;
+
+	if (!isInSupplementaryGroup(AID_INET)) {
+		fprintf(stderr, "You must have internet permissions to use ping.  Aborting.\n");
+		exit(2);
+	}
 
 	source.sin_family = AF_INET;
 
