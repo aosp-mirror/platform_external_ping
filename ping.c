@@ -1673,6 +1673,7 @@ void usage(void)
 
 int isInSupplementaryGroup(gid_t group) {
 	long ngroups_max;
+	gid_t empty[0];
 	gid_t *groups;
 	int ngroups;
 	int i;
@@ -1682,13 +1683,17 @@ int isInSupplementaryGroup(gid_t group) {
 		return 1;
 	}
 
-	ngroups_max = sysconf(_SC_NGROUPS_MAX) + 1;
-	groups = (gid_t *) malloc(ngroups_max * sizeof(gid_t));
-	if (groups == NULL) {
-		fprintf(stderr, "ping: unable to allocate memory.  Aborting\n");
+	ngroups = getgroups(0, empty);
+	if (ngroups < 0) {
+		perror("ping: call to getgroups for sizing failed");
 		exit(2);
 	}
-	ngroups = getgroups(ngroups_max, groups);
+	groups = (gid_t *) malloc((ngroups * sizeof(gid_t)));
+	if (groups == NULL) {
+		fprintf(stderr, "ping: unable to allocate memory for %d groups.  Aborting\n", ngroups);
+		exit(2);
+	}
+	ngroups = getgroups(ngroups, groups);
 	if (ngroups < 0) {
 		perror("ping: getgroups failed");
 		exit(2);
