@@ -7,7 +7,11 @@
 #include <linux/sockios.h>
 #include <sys/file.h>
 #include <sys/time.h>
+#ifdef ANDROID
 #include <signal.h>
+#else
+#include <sys/signal.h>
+#endif
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <sys/uio.h>
@@ -20,6 +24,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/errqueue.h>
+
+#ifdef ANDROID
+#include <linux/icmp.h>
+#endif
+
+#include "SNAPSHOT.h"
 
 #define	DEFDATALEN	(64 - 8)	/* default data length */
 
