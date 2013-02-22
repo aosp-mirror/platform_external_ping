@@ -7,11 +7,7 @@
 #include <linux/sockios.h>
 #include <sys/file.h>
 #include <sys/time.h>
-#ifdef ANDROID
-#include <signal.h>
-#else
 #include <sys/signal.h>
-#endif
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <sys/uio.h>
