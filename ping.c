@@ -64,8 +64,6 @@ char copyright[] =
 #include <netinet/ip_icmp.h>
 
 #ifdef ANDROID
-#include <sys/types.h>
-#include <private/android_filesystem_config.h>
 #define bcmp(a, b, c) memcmp(a, b, c)
 #endif
 
@@ -110,47 +108,6 @@ struct sockaddr_in source;
 char *device;
 int pmtudisc = -1;
 
-#ifdef ANDROID
-int isInSupplementaryGroup(gid_t group) {
-	long ngroups_max;
-	gid_t empty[0];
-	gid_t *groups;
-	int ngroups;
-	int i;
-
-	if (getuid() == 0) {
-		// root is presumed to be in every group
-		return 1;
-	}
-
-	ngroups = getgroups(0, empty);
-	if (ngroups < 0) {
-		perror("ping: call to getgroups for sizing failed");
-		exit(2);
-	}
-	groups = (gid_t *) malloc((ngroups * sizeof(gid_t)));
-	if (groups == NULL) {
-		fprintf(stderr, "ping: unable to allocate memory for %d groups.  Aborting\n", ngroups);
-		exit(2);
-	}
-	ngroups = getgroups(ngroups, groups);
-	if (ngroups < 0) {
-		perror("ping: getgroups failed");
-		exit(2);
-	}
-
-	for (i = 0; i < ngroups; i++) {
-		if (group == groups[i]) {
-			free(groups);
-			return 1;
-		}
-	}
-
-	free(groups);
-	return 0;
-}
-#endif
-
 int
 main(int argc, char **argv)
 {
@@ -168,12 +125,6 @@ main(int argc, char **argv)
 		icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	socket_errno = errno;
 
-#ifdef ANDROID
-	if (!isInSupplementaryGroup(AID_INET)) {
-		fprintf(stderr, "You must have internet permissions to use ping.  Aborting.\n");
-		exit(2);
-	}
-#endif
 	uid = getuid();
 	setuid(uid);
 
