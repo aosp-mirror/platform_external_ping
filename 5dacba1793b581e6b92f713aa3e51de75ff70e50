@@ -1,0 +1,55 @@
+{
+  "comments": [
+    {
+      "key": {
+        "uuid": "SwUEQEpY",
+        "filename": "ping.c",
+        "patchSetId": 2
+      },
+      "lineNbr": 358,
+      "author": {
+        "id": 1010138
+      },
+      "writtenOn": "2013-03-29T03:07:13Z",
+      "side": 1,
+      "message": "I think this can just be stripped, right?",
+      "revId": "5dacba1793b581e6b92f713aa3e51de75ff70e50",
+      "serverId": "85c56323-6fa9-3386-8a01-6480fb634889",
+      "unresolved": false
+    },
+    {
+      "key": {
+        "uuid": "SwYEKGmY",
+        "filename": "ping.c",
+        "patchSetId": 2
+      },
+      "lineNbr": 518,
+      "author": {
+        "id": 1010138
+      },
+      "writtenOn": "2013-03-29T03:07:13Z",
+      "side": 1,
+      "message": "this too?",
+      "revId": "5dacba1793b581e6b92f713aa3e51de75ff70e50",
+      "serverId": "85c56323-6fa9-3386-8a01-6480fb634889",
+      "unresolved": false
+    },
+    {
+      "key": {
+        "uuid": "SwWEHFl4",
+        "filename": "ping.c",
+        "patchSetId": 2
+      },
+      "lineNbr": 846,
+      "author": {
+        "id": 1010138
+      },
+      "writtenOn": "2013-03-29T03:07:13Z",
+      "side": 1,
+      "message": "Same for this. Actually, can you just strip out the getuid check at the top?",
+      "revId": "5dacba1793b581e6b92f713aa3e51de75ff70e50",
+      "serverId": "85c56323-6fa9-3386-8a01-6480fb634889",
+      "unresolved": false
+    }
+  ]
+}
