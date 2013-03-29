@@ -64,6 +64,7 @@ char copyright[] =
 #include <netinet/ip_icmp.h>
 
 #ifdef ANDROID
+#include <sys/auxv.h>
 #define bcmp(a, b, c) memcmp(a, b, c)
 #endif
 
@@ -118,6 +119,13 @@ main(int argc, char **argv)
 	char *target, hnamebuf[MAXHOSTNAMELEN];
 	char rspace[3 + 4 * NROUTES + 1];	/* record route space */
 
+#ifdef ANDROID
+	if (getauxval(AT_SECURE) != 0) {
+		fprintf(stderr, "This version of ping should NOT run with privileges. Aborting\n");
+		exit(1);
+	}
+#endif
+
 	icmp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	if (icmp_sock != -1)
 		using_ping_socket = 1;
@@ -126,7 +134,9 @@ main(int argc, char **argv)
 	socket_errno = errno;
 
 	uid = getuid();
+#ifndef ANDROID
 	setuid(uid);
+#endif
 
 	source.sin_family = AF_INET;
 
