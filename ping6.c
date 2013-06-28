@@ -112,6 +112,20 @@ char copyright[] =
 #define BIT_SET(nr, addr) do { ((__u32 *)(addr))[(nr) >> 5] |= (1U << ((nr) & 31)); } while(0)
 #define BIT_TEST(nr, addr) do { (__u32 *)(addr))[(nr) >> 5] & (1U << ((nr) & 31)); } while(0)
 
+/* ICMP6_FILTER is defined in linux/icmpv6.h, which we can't include because it
+ * defines struct icmp6_filter, also defined in netinet/icmp6.h. Also, undefine
+ * the ICMP6_FILTER_XXX macros, because the ones provided by netinet/icmp6.h
+ * don't work on Linux - http://b/9671560 . */
+#ifdef ANDROID
+#define ICMP6_FILTER 1
+#undef ICMP6_FILTER_WILLPASS
+#undef ICMP6_FILTER_WILLBLOCK
+#undef ICMP6_FILTER_SETPASS
+#undef ICMP6_FILTER_SETBLOCK
+#undef ICMP6_FILTER_SETPASSALL
+#undef ICMP6_FILTER_SETBLOCKALL
+#endif
+
 #ifndef ICMP6_FILTER_WILLPASS
 #define ICMP6_FILTER_WILLPASS(type, filterp) \
 	(BIT_TEST((type), filterp) == 0)

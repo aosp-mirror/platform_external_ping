@@ -2,6 +2,19 @@
 
 #define NI_NONCE_SIZE			8
 
+/* On Android, the ni_xxx macros are already provided by netinet/icmp6.h.
+ * Undefine them here to avoid "ni_xxx redefined" compiler warnings. GCC
+ * provides no way to suppress these except by completely disabling all
+ * preprocessor warnings.
+ */
+#ifdef ANDROID
+#undef ni_type
+#undef ni_code
+#undef ni_cksum
+#undef ni_qtype
+#undef ni_flags
+#endif
+
 /* Node Information Query */
 struct ni_hdr {
 	struct icmp6_hdr		ni_u;
