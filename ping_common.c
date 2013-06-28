@@ -1,17 +1,18 @@
 #include "ping_common.h"
 #include <ctype.h>
 #include <sched.h>
+#include <math.h>
 
 int options;
 
+int mark;
 int sndbuf;
 int ttl;
 int rtt;
 int rtt_addend;
 __u16 acked;
 
-int mx_dup_ck = MAX_DUP_CHK;
-char rcvd_tbl[MAX_DUP_CHK / 8];
+struct rcvd_table rcvd_tbl;
 
 
 /* counters */
@@ -29,6 +30,8 @@ struct timeval start_time, cur_time;
 volatile int exiting;
 volatile int status_snapshot;
 int confirm = 0;
+volatile int in_pr_addr = 0;	/* pr_addr() is executing */
+jmp_buf pr_addr_jmp;
 
 /* Stupid workarounds for bugs/missing functionality in older linuces.
  * confirm_flag fixes refusing service of kernels without MSG_CONFIRM.
@@ -55,9 +58,144 @@ int datalen = DEFDATALEN;
 
 char *hostname;
 int uid;
+uid_t euid;
 int ident;			/* process id to identify our packets */
 
 static int screen_width = INT_MAX;
+
+#define ARRAY_SIZE(a)	(sizeof(a) / sizeof(a[0]))
+
+#ifdef CAPABILITIES
+static cap_value_t cap_raw = CAP_NET_RAW;
+static cap_value_t cap_admin = CAP_NET_ADMIN;
+#endif
+
+void limit_capabilities(void)
+{
+#ifdef CAPABILITIES
+	cap_t cap_cur_p;
+	cap_t cap_p;
+	cap_flag_value_t cap_ok;
+
+	cap_cur_p = cap_get_proc();
+	if (!cap_cur_p) {
+		perror("ping: cap_get_proc");
+		exit(-1);
+	}
+
+	cap_p = cap_init();
+	if (!cap_p) {
+		perror("ping: cap_init");
+		exit(-1);
+	}
+
+	cap_ok = CAP_CLEAR;
+	cap_get_flag(cap_cur_p, CAP_NET_ADMIN, CAP_PERMITTED, &cap_ok);
+
+	if (cap_ok != CAP_CLEAR)
+		cap_set_flag(cap_p, CAP_PERMITTED, 1, &cap_admin, CAP_SET);
+
+	cap_ok = CAP_CLEAR;
+	cap_get_flag(cap_cur_p, CAP_NET_RAW, CAP_PERMITTED, &cap_ok);
+
+	if (cap_ok != CAP_CLEAR)
+		cap_set_flag(cap_p, CAP_PERMITTED, 1, &cap_raw, CAP_SET);
+
+	if (cap_set_proc(cap_p) < 0) {
+		perror("ping: cap_set_proc");
+		exit(-1);
+	}
+
+	if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
+		perror("ping: prctl");
+		exit(-1);
+	}
+
+	if (setuid(getuid()) < 0) {
+		perror("setuid");
+		exit(-1);
+	}
+
+	if (prctl(PR_SET_KEEPCAPS, 0) < 0) {
+		perror("ping: prctl");
+		exit(-1);
+	}
+
+	cap_free(cap_p);
+	cap_free(cap_cur_p);
+#endif
+	uid = getuid();
+	euid = geteuid();
+#ifndef CAPABILITIES
+	if (seteuid(uid)) {
+		perror("ping: setuid");
+		exit(-1);
+	}
+#endif
+}
+
+#ifdef CAPABILITIES
+int modify_capability(cap_value_t cap, cap_flag_value_t on)
+{
+	cap_t cap_p = cap_get_proc();
+	cap_flag_value_t cap_ok;
+	int rc = -1;
+
+	if (!cap_p) {
+		perror("ping: cap_get_proc");
+		goto out;
+	}
+
+	cap_ok = CAP_CLEAR;
+	cap_get_flag(cap_p, cap, CAP_PERMITTED, &cap_ok);
+	if (cap_ok == CAP_CLEAR) {
+		rc = on ? -1 : 0;
+		goto out;
+	}
+
+	cap_set_flag(cap_p, CAP_EFFECTIVE, 1, &cap, on);
+
+	if (cap_set_proc(cap_p) < 0) {
+		perror("ping: cap_set_proc");
+		goto out;
+	}
+
+	cap_free(cap_p);
+
+	rc = 0;
+out:
+	if (cap_p)
+		cap_free(cap_p);
+	return rc;
+}
+#else
+int modify_capability(int on)
+{
+	if (seteuid(on ? euid : getuid())) {
+		perror("seteuid");
+		return -1;
+	}
+
+	return 0;
+}
+#endif
+
+void drop_capabilities(void)
+{
+#ifdef CAPABILITIES
+	cap_t cap = cap_init();
+	if (cap_set_proc(cap) < 0) {
+		perror("ping: cap_set_proc");
+		exit(-1);
+	}
+	cap_free(cap);
+#else
+	if (setuid(getuid())) {
+		perror("ping: setuid");
+		exit(-1);
+	}
+#endif
+}
 
 /* Fills all the outpack, excluding ICMP header, but _including_
  * timestamp area with supplied pattern.
@@ -67,7 +205,11 @@ static void fill(char *patp)
 	int ii, jj, kk;
 	int pat[16];
 	char *cp;
-	char *bp = outpack+8;
+	u_char *bp = outpack+8;
+
+#ifdef USE_IDN
+	setlocale(LC_ALL, "C");
+#endif
 
 	for (cp = patp; *cp; cp++) {
 		if (!isxdigit(*cp)) {
@@ -93,6 +235,10 @@ static void fill(char *patp)
 			printf("%02x", bp[jj] & 0xFF);
 		printf("\n");
 	}
+
+#ifdef USE_IDN
+	setlocale(LC_ALL, "");
+#endif
 }
 
 void common_options(int ch)
@@ -114,31 +260,37 @@ void common_options(int ch)
 	case 'd':
 		options |= F_SO_DEBUG;
 		break;
-	case 'f':
-		options |= F_FLOOD;
-		setbuf(stdout, (char *)NULL);
+	case 'D':
+		options |= F_PTIMEOFDAY;
 		break;
 	case 'i':		/* wait between sending packets */
 	{
-		if (strchr(optarg, '.')) {
-			float t;
-			if (sscanf(optarg, "%f", &t) != 1) {
-				fprintf(stderr, "ping: bad timing interval.\n");
-				exit(2);
-			}
-			interval = (int)(t*1000);
-		} else if (sscanf(optarg, "%d", &interval) == 1) {
-			interval *= 1000;
-		} else {
-			fprintf(stderr, "ping: bad timing interval.\n");
+		double dbl;
+		char *ep;
+
+		errno = 0;
+		dbl = strtod(optarg, &ep);
+
+		if (errno || *ep != '\0' ||
+		    !finite(dbl) || dbl < 0.0 || dbl >= (double)INT_MAX / 1000 - 1.0) {
+			fprintf(stderr, "ping: bad timing interval\n");
 			exit(2);
 		}
 
-		if (interval < 0) {
-			fprintf(stderr, "ping: bad timing interval.\n");
+		interval = (int)(dbl * 1000);
+
+		options |= F_INTERVAL;
+		break;
+	}
+	case 'm':
+	{
+		char *endp;
+		mark = (int)strtoul(optarg, &endp, 10);
+		if (mark < 0 || *endp != '\0') {
+			fprintf(stderr, "mark cannot be negative\n");
 			exit(2);
 		}
-		options |= F_INTERVAL;
+		options |= F_MARK;
 		break;
 	}
 	case 'w':
@@ -151,15 +303,18 @@ void common_options(int ch)
 	case 'l':
 		preload = atoi(optarg);
 		if (preload <= 0) {
-			fprintf(stderr, "ping: bad preload value, should be 1..%d\n", mx_dup_ck);
+			fprintf(stderr, "ping: bad preload value, should be 1..%d\n", MAX_DUP_CHK);
 			exit(2);
 		}
-		if (preload > mx_dup_ck)
-			preload = mx_dup_ck;
+		if (preload > MAX_DUP_CHK)
+			preload = MAX_DUP_CHK;
 		if (uid && preload > 3) {
 			fprintf(stderr, "ping: cannot set preload to value > 3\n");
 			exit(2);
 		}
+		break;
+	case 'O':
+		options |= F_OUTSTANDING;
 		break;
 	case 'S':
 		sndbuf = atoi(optarg);
@@ -168,6 +323,10 @@ void common_options(int ch)
 			exit(2);
 		}
 		break;
+	case 'f':
+		options |= F_FLOOD;
+		setbuf(stdout, (char *)NULL);
+		/* fallthrough to numeric - avoid gethostbyaddr during flood */
 	case 'n':
 		options |= F_NUMERIC;
 		break;
@@ -185,6 +344,11 @@ void common_options(int ch)
 		datalen = atoi(optarg);
 		if (datalen < 0) {
 			fprintf(stderr, "ping: illegal negative packet size %d.\n", datalen);
+			exit(2);
+		}
+		if (datalen > maxpacket - 8) {
+			fprintf(stderr, "ping: packet size too large: %d\n",
+				datalen);
 			exit(2);
 		}
 		break;
@@ -217,7 +381,7 @@ void common_options(int ch)
 		lingertime *= 1000;
 		break;
 	case 'V':
-		printf("ping utility, iputils-ss%s\n", SNAPSHOT);
+		printf("ping utility, iputils-%s\n", SNAPSHOT);
 		exit(0);
 	default:
 		abort();
@@ -228,6 +392,8 @@ void common_options(int ch)
 static void sigexit(int signo)
 {
 	exiting = 1;
+	if (in_pr_addr)
+		longjmp(pr_addr_jmp, 0);
 }
 
 static void sigstatus(int signo)
@@ -264,11 +430,24 @@ int __schedule_exit(int next)
 
 static inline void update_interval(void)
 {
-	int est = rtt ? rtt/8 : interval*1000; 
+	int est = rtt ? rtt/8 : interval*1000;
 
 	interval = (est+rtt_addend+500)/1000;
 	if (uid && interval < MINUSERINTERVAL)
 		interval = MINUSERINTERVAL;
+}
+
+/*
+ * Print timestamp
+ */
+void print_timestamp(void)
+{
+	if (options & F_PTIMEOFDAY) {
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		printf("[%lu.%06lu] ",
+		       (unsigned long)tv.tv_sec, (unsigned long)tv.tv_usec);
+	}
 }
 
 /*
@@ -285,7 +464,7 @@ int pinger(void)
 	static int tokens;
 	int i;
 
-	/* Have we already sent enough? If we have, return an arbitrary positive value. */ 
+	/* Have we already sent enough? If we have, return an arbitrary positive value. */
 	if (exiting || (npackets && ntransmitted >= npackets && !deadline))
 		return 1000;
 
@@ -316,6 +495,14 @@ int pinger(void)
 		tokens = ntokens - interval;
 	}
 
+	if (options & F_OUTSTANDING) {
+		if (ntransmitted > 0 && !rcvd_test(ntransmitted)) {
+			print_timestamp();
+			printf("no answer yet for icmp_seq=%lu\n", (ntransmitted % MAX_DUP_CHK));
+			fflush(stdout);
+		}
+	}
+
 resend:
 	i = send_probe();
 
@@ -327,7 +514,7 @@ resend:
 			 * high preload or pipe size is very confusing. */
 			if ((preload < screen_width && pipesize < screen_width) ||
 			    in_flight() < screen_width)
-				write(STDOUT_FILENO, ".", 1);
+				write_stdout(".", 1);
 		}
 		return interval - tokens;
 	}
@@ -380,7 +567,7 @@ resend:
 
 	if (i == 0 && !(options & F_QUIET)) {
 		if (options & F_FLOOD)
-			write(STDOUT_FILENO, "E", 1);
+			write_stdout("E", 1);
 		else
 			perror("ping: sendmsg");
 	}
@@ -393,7 +580,7 @@ resend:
 void sock_setbufs(int icmp_sock, int alloc)
 {
 	int rcvbuf, hold;
-	int tmplen = sizeof(hold);
+	socklen_t tmplen = sizeof(hold);
 
 	if (!sndbuf)
 		sndbuf = alloc;
@@ -415,6 +602,7 @@ void setup(int icmp_sock)
 {
 	int hold;
 	struct timeval tv;
+	sigset_t sset;
 
 	if ((options & F_FLOOD) && !(options & F_INTERVAL))
 		interval = 0;
@@ -442,6 +630,20 @@ void setup(int icmp_sock)
 			fprintf(stderr, "Warning: no SO_TIMESTAMP support, falling back to SIOCGSTAMP\n");
 	}
 #endif
+	if (options & F_MARK) {
+		int ret;
+
+		enable_capability_admin();
+		ret = setsockopt(icmp_sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+		disable_capability_admin();
+
+		if (ret == -1) {
+			/* we probably dont wanna exit since old kernels
+			 * dont support mark ..
+			*/
+			fprintf(stderr, "Warning: Failed to set mark %d\n", mark);
+		}
+	}
 
 	/* Set some SNDTIMEO to prevent blocking forever
 	 * on sends, when device is too slow or stalls. Just put limit
@@ -464,7 +666,7 @@ void setup(int icmp_sock)
 
 	if (!(options & F_PINGFILLED)) {
 		int i;
-		char *p = outpack+8;
+		u_char *p = outpack+8;
 
 		/* Do not forget about case of small datalen,
 		 * fill timestamp area too!
@@ -474,11 +676,14 @@ void setup(int icmp_sock)
 	}
 
 	if (!ident)
-		ident = getpid() & 0xFFFF;
+		ident = htons(getpid() & 0xFFFF);
 
 	set_signal(SIGINT, sigexit);
 	set_signal(SIGALRM, sigexit);
 	set_signal(SIGQUIT, sigstatus);
+
+	sigemptyset(&sset);
+	sigprocmask(SIG_SETMASK, &sset, NULL);
 
 	gettimeofday(&start_time, NULL);
 
@@ -539,7 +744,7 @@ void main_loop(int icmp_sock, __u8 *packet, int packlen)
 		 * If next<=0 send now or as soon as possible. */
 
 		/* Technical part. Looks wicked. Could be dropped,
-		 * if everyone used the newest kernel. :-) 
+		 * if everyone used the newest kernel. :-)
 		 * Its purpose is:
 		 * 1. Provide intervals less than resolution of scheduler.
 		 *    Solution: spinning.
@@ -550,8 +755,8 @@ void main_loop(int icmp_sock, __u8 *packet, int packlen)
 			int recv_expected = in_flight();
 
 			/* If we are here, recvmsg() is unable to wait for
-			 * required timeout. */ 
-			if (1000*next <= 1000000/(int)HZ) {
+			 * required timeout. */
+			if (1000 % HZ == 0 ? next <= 1000 / HZ : (next < INT_MAX / HZ && next * HZ <= 1000)) {
 				/* Very short timeout... So, if we wait for
 				 * something, we sleep for MININTERVAL.
 				 * Otherwise, spin! */
@@ -587,6 +792,7 @@ void main_loop(int icmp_sock, __u8 *packet, int packlen)
 					   * destined to other running pings. */
 
 			iov.iov_len = packlen;
+			memset(&msg, 0, sizeof(msg));
 			msg.msg_name = addrbuf;
 			msg.msg_namelen = sizeof(addrbuf);
 			msg.msg_iov = &iov;
@@ -630,7 +836,7 @@ void main_loop(int icmp_sock, __u8 *packet, int packlen)
 				not_ours = parse_reply(&msg, cc, addrbuf, recv_timep);
 			}
 
-			/* See? ... someone runs another ping on this host. */ 
+			/* See? ... someone runs another ping on this host. */
 			if (not_ours)
 				install_filter();
 
@@ -647,11 +853,14 @@ void main_loop(int icmp_sock, __u8 *packet, int packlen)
 	finish();
 }
 
-int gather_statistics(__u8 *ptr, int cc, __u16 seq, int hops,
-		      int csfailed, struct timeval *tv, char *from)
+int gather_statistics(__u8 *icmph, int icmplen,
+		      int cc, __u16 seq, int hops,
+		      int csfailed, struct timeval *tv, char *from,
+		      void (*pr_reply)(__u8 *icmph, int cc))
 {
 	int dupflag = 0;
 	long triptime = 0;
+	__u8 *ptr = icmph + icmplen;
 
 	++nreceived;
 	if (!csfailed)
@@ -692,12 +901,12 @@ restamp:
 	if (csfailed) {
 		++nchecksum;
 		--nreceived;
-	} else if (TST(seq % mx_dup_ck)) {
+	} else if (rcvd_test(seq)) {
 		++nrepeats;
 		--nreceived;
 		dupflag = 1;
 	} else {
-		SET(seq % mx_dup_ck);
+		rcvd_set(seq);
 		dupflag = 0;
 	}
 	confirm = confirm_flag;
@@ -707,13 +916,18 @@ restamp:
 
 	if (options & F_FLOOD) {
 		if (!csfailed)
-			write(STDOUT_FILENO, "\b \b", 3);
+			write_stdout("\b \b", 3);
 		else
-			write(STDOUT_FILENO, "\bC", 1);
+			write_stdout("\bC", 2);
 	} else {
 		int i;
 		__u8 *cp, *dp;
-		printf("%d bytes from %s: icmp_seq=%u", cc, from, seq);
+
+		print_timestamp();
+		printf("%d bytes from %s:", cc, from);
+
+		if (pr_reply)
+			pr_reply(icmph, cc);
 
 		if (hops >= 0)
 			printf(" ttl=%d", hops);
@@ -782,6 +996,7 @@ static long llsqrt(long long a)
 void finish(void)
 {
 	struct timeval tv = cur_time;
+	char *comma = "";
 
 	tvsub(&tv, &start_time);
 
@@ -812,18 +1027,21 @@ void finish(void)
 		tmdev = llsqrt(tsum2 - tsum * tsum);
 
 		printf("rtt min/avg/max/mdev = %ld.%03ld/%lu.%03ld/%ld.%03ld/%ld.%03ld ms",
-		       tmin/1000, tmin%1000,
+		       (long)tmin/1000, (long)tmin%1000,
 		       (unsigned long)(tsum/1000), (long)(tsum%1000),
-		       tmax/1000, tmax%1000,
-		       tmdev/1000, tmdev%1000
+		       (long)tmax/1000, (long)tmax%1000,
+		       (long)tmdev/1000, (long)tmdev%1000
 		       );
+		comma = ", ";
 	}
-	if (pipesize > 1)
-		printf(", pipe %d", pipesize);
-	if (ntransmitted > 1 && (!interval || (options&(F_FLOOD|F_ADAPTIVE)))) {
+	if (pipesize > 1) {
+		printf("%spipe %d", comma, pipesize);
+		comma = ", ";
+	}
+	if (nreceived && (!interval || (options&(F_FLOOD|F_ADAPTIVE))) && ntransmitted > 1) {
 		int ipg = (1000000*(long long)tv.tv_sec+tv.tv_usec)/(ntransmitted-1);
-		printf(", ipg/ewma %d.%03d/%d.%03d ms",
-		       ipg/1000, ipg%1000, rtt/8000, (rtt/8)%1000);
+		printf("%sipg/ewma %d.%03d/%d.%03d ms",
+		       comma, ipg/1000, ipg%1000, rtt/8000, (rtt/8)%1000);
 	}
 	putchar('\n');
 	exit(!nreceived || (deadline && nreceived < npackets));
@@ -846,10 +1064,10 @@ void status(void)
 		tavg = tsum / (nreceived + nrepeats);
 
 		fprintf(stderr, ", min/avg/ewma/max = %ld.%03ld/%lu.%03ld/%d.%03d/%ld.%03ld ms",
-		       tmin/1000, tmin%1000,
+		       (long)tmin/1000, (long)tmin%1000,
 		       tavg/1000, tavg%1000,
 		       rtt/8000, (rtt/8)%1000,
-		       tmax/1000, tmax%1000
+		       (long)tmax/1000, (long)tmax%1000
 		       );
 	}
 	fprintf(stderr, "\n");

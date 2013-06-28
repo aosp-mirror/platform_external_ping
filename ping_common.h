@@ -16,9 +16,21 @@
 #include <errno.h>
 #include <string.h>
 #include <netdb.h>
+#include <setjmp.h>
+
+#ifdef CAPABILITIES
+#include <sys/prctl.h>
+#include <sys/capability.h>
+#endif
+
+#ifdef USE_IDN
+#include <locale.h>
+#include <idna.h>
+#endif
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <linux/types.h>
 #include <linux/errqueue.h>
 
 #ifdef ANDROID
@@ -34,12 +46,6 @@
 #define MINUSERINTERVAL	200		/* Minimal allowed interval for non-root */
 
 #define SCHINT(a)	(((a) <= MININTERVAL) ? MININTERVAL : (a))
-
-#define	A(bit)		rcvd_tbl[(bit)>>3]	/* identify byte in array */
-#define	B(bit)		(1 << ((bit) & 0x07))	/* identify bit in byte */
-#define	SET(bit)	(A(bit) |= B(bit))
-#define	CLR(bit)	(A(bit) &= (~B(bit)))
-#define	TST(bit)	(A(bit) & B(bit))
 
 /* various options */
 extern int options;
@@ -63,15 +69,58 @@ extern int options;
 #define	F_STRICTSOURCE	0x8000
 #define F_NOLOOP	0x10000
 #define F_TTL		0x20000
+#define F_MARK		0x40000
+#define F_PTIMEOFDAY	0x80000
+#define F_OUTSTANDING	0x100000
 
 /*
  * MAX_DUP_CHK is the number of bits in received table, i.e. the maximum
  * number of received sequence numbers we can keep track of.
  */
 #define	MAX_DUP_CHK	0x10000
-extern int mx_dup_ck;
-extern char rcvd_tbl[MAX_DUP_CHK / 8];
 
+#if defined(__WORDSIZE) && __WORDSIZE == 64
+# define USE_BITMAP64
+#endif
+
+#ifdef USE_BITMAP64
+typedef __u64	bitmap_t;
+# define BITMAP_SHIFT	6
+#else
+typedef __u32	bitmap_t;
+# define BITMAP_SHIFT	5
+#endif
+
+#if ((MAX_DUP_CHK >> (BITMAP_SHIFT + 3)) << (BITMAP_SHIFT + 3)) != MAX_DUP_CHK
+# error Please MAX_DUP_CHK and/or BITMAP_SHIFT
+#endif
+
+struct rcvd_table {
+	bitmap_t bitmap[MAX_DUP_CHK / (sizeof(bitmap_t) * 8)];
+};
+
+extern struct rcvd_table rcvd_tbl;
+
+#define	A(bit)	(rcvd_tbl.bitmap[(bit) >> BITMAP_SHIFT])	/* identify word in array */
+#define	B(bit)	(((bitmap_t)1) << ((bit) & ((1 << BITMAP_SHIFT) - 1)))	/* identify bit in word */
+
+static inline void rcvd_set(__u16 seq)
+{
+	unsigned bit = seq % MAX_DUP_CHK;
+	A(bit) |= B(bit);
+}
+
+static inline void rcvd_clear(__u16 seq)
+{
+	unsigned bit = seq % MAX_DUP_CHK;
+	A(bit) &= ~B(bit);
+}
+
+static inline bitmap_t rcvd_test(__u16 seq)
+{
+	unsigned bit = seq % MAX_DUP_CHK;
+	return A(bit) & B(bit);
+}
 
 extern u_char outpack[];
 extern int maxpacket;
@@ -101,6 +150,9 @@ extern int confirm;
 extern int confirm_flag;
 extern int working_recverr;
 
+extern volatile int in_pr_addr;		/* pr_addr() is executing */
+extern jmp_buf pr_addr_jmp;
+
 #ifndef MSG_CONFIRM
 #define MSG_CONFIRM 0
 #endif
@@ -121,10 +173,23 @@ case 'a': case 'U': case 'c': case 'd': \
 case 'f': case 'i': case 'w': case 'l': \
 case 'S': case 'n': case 'p': case 'q': \
 case 'r': case 's': case 'v': case 'L': \
-case 't': case 'A': case 'W': case 'B':
+case 't': case 'A': case 'W': case 'B': case 'm': \
+case 'D': case 'O':
 
-#define COMMON_OPTSTR "h?VQ:I:M:aUc:dfi:w:l:S:np:qrs:vLt:AW:B"
+#define COMMON_OPTSTR "h?VQ:I:M:aUc:dfi:w:l:S:np:qrs:vLt:AW:Bm:DO"
 
+/*
+ * Write to stdout
+ */
+static inline void write_stdout(const char *str, size_t len)
+{
+	size_t o = 0;
+	ssize_t cc;
+	do {
+		cc = write(STDOUT_FILENO, str + o, len - o);
+		o += cc;
+	} while (len > o || cc < 0);
+}
 
 /*
  * tvsub --
@@ -169,7 +234,7 @@ static inline int in_flight(void)
 }
 
 static inline void acknowledge(__u16 seq)
-{ 
+{
 	__u16 diff = (__u16)ntransmitted - seq;
 	if (diff <= 0x7FFF) {
 		if ((int)diff+1 > pipesize)
@@ -188,6 +253,25 @@ static inline void advance_ntransmitted(void)
 		acked = (__u16)ntransmitted + 1;
 }
 
+extern void limit_capabilities(void);
+static int enable_capability_raw(void);
+static int disable_capability_raw(void);
+static int enable_capability_admin(void);
+static int disable_capability_admin(void);
+#ifdef CAPABILITIES
+extern int modify_capability(cap_value_t, cap_flag_value_t);
+static inline int enable_capability_raw(void)		{ return modify_capability(CAP_NET_RAW,   CAP_SET);   };
+static inline int disable_capability_raw(void)		{ return modify_capability(CAP_NET_RAW,   CAP_CLEAR); };
+static inline int enable_capability_admin(void)		{ return modify_capability(CAP_NET_ADMIN, CAP_SET);   };
+static inline int disable_capability_admin(void)	{ return modify_capability(CAP_NET_ADMIN, CAP_CLEAR); };
+#else
+extern int modify_capability(int);
+static inline int enable_capability_raw(void)		{ return modify_capability(1); };
+static inline int disable_capability_raw(void)		{ return modify_capability(0); };
+static inline int enable_capability_admin(void)		{ return modify_capability(1); };
+static inline int disable_capability_admin(void)	{ return modify_capability(0); };
+#endif
+extern void drop_capabilities(void);
 
 extern int send_probe(void);
 extern int receive_error_msg(void);
@@ -201,5 +285,8 @@ extern void main_loop(int icmp_sock, __u8 *buf, int buflen) __attribute__((noret
 extern void finish(void) __attribute__((noreturn));
 extern void status(void);
 extern void common_options(int ch);
-extern int gather_statistics(__u8 *ptr, int cc, __u16 seq, int hops,
-			     int csfailed, struct timeval *tv, char *from);
+extern int gather_statistics(__u8 *ptr, int icmplen,
+			     int cc, __u16 seq, int hops,
+			     int csfailed, struct timeval *tv, char *from,
+			     void (*pr_reply)(__u8 *ptr, int cc));
+extern void print_timestamp(void);
