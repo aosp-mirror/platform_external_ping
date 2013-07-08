@@ -697,7 +697,6 @@ void setup(int icmp_sock)
 		setitimer(ITIMER_REAL, &it, NULL);
 	}
 
-#ifndef ANDROID
 	if (isatty(STDOUT_FILENO)) {
 		struct winsize w;
 
@@ -706,7 +705,6 @@ void setup(int icmp_sock)
 				screen_width = w.ws_col;
 		}
 	}
-#endif
 }
 
 void main_loop(int icmp_sock, __u8 *packet, int packlen)
